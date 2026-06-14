@@ -21,13 +21,11 @@ class RuntimeConnectionService:
                 headers={"Authorization": authorization},
             )
         if response.status_code == 409:
-            raise IntegrationConfigurationError("Connect GitHub and Vercel first")
+            raise IntegrationConfigurationError("Connect GitHub first")
         response.raise_for_status()
         payload = response.json()
-        if not payload.get("githubToken") or not payload.get("vercelToken"):
-            raise IntegrationConfigurationError("Connect GitHub and Vercel first")
-        if not payload.get("projects"):
-            raise IntegrationConfigurationError("Track at least one Vercel project")
+        if not payload.get("githubToken"):
+            raise IntegrationConfigurationError("Connect GitHub first")
         return payload
 
 
@@ -128,6 +126,87 @@ class VercelService:
             if text:
                 lines.append(str(text))
         return "\n".join(lines)[-50_000:]
+
+
+class RenderService:
+    base_url = "https://api.render.com/v1"
+    failed_statuses = {"build_failed", "update_failed", "canceled", "deactivated"}
+
+    async def _get(
+        self,
+        token: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+        response.raise_for_status()
+        return response.json()
+
+    async def failed_deployments(
+        self,
+        token: str,
+        service_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        payload = await self._get(
+            token,
+            f"/services/{service_id}/deploys",
+            {"limit": min(limit, 100)},
+        )
+        rows = payload if isinstance(payload, list) else payload.get("deploys", [])
+        deploys = [row.get("deploy", row) for row in rows]
+        return [
+            deploy for deploy in deploys
+            if str(deploy.get("status", "")).lower() in self.failed_statuses
+        ]
+
+    async def logs(
+        self,
+        token: str,
+        owner_id: str,
+        service_id: str,
+        deploy: dict[str, Any],
+    ) -> str:
+        params: dict[str, Any] = {
+            "ownerId": owner_id,
+            "resource": service_id,
+            "type": "build",
+            "direction": "forward",
+            "limit": 100,
+        }
+        if deploy.get("createdAt"):
+            params["startTime"] = deploy["createdAt"]
+        if deploy.get("finishedAt") or deploy.get("updatedAt"):
+            params["endTime"] = deploy.get("finishedAt") or deploy.get("updatedAt")
+        payload = await self._get(token, "/logs", params)
+        rows = payload.get("logs", []) if isinstance(payload, dict) else payload
+        return "\n".join(
+            str(row.get("message") or row.get("text") or row.get("msg") or "")
+            for row in rows
+            if row.get("message") or row.get("text") or row.get("msg")
+        )[-50_000:]
+
+    @staticmethod
+    def git_metadata(deploy: dict[str, Any]) -> dict[str, str | None]:
+        commit = deploy.get("commit")
+        if isinstance(commit, dict):
+            commit_sha = commit.get("id") or commit.get("sha")
+            commit_message = commit.get("message")
+        else:
+            commit_sha = commit or deploy.get("commitId")
+            commit_message = None
+        return {
+            "commit_sha": str(commit_sha) if commit_sha else None,
+            "commit_message": str(commit_message) if commit_message else None,
+        }
 
 
 class GitHubMCPService:
@@ -298,5 +377,6 @@ class GitHubMCPService:
 
 
 vercel_service = VercelService()
+render_service = RenderService()
 github_mcp_service = GitHubMCPService()
 runtime_connection_service = RuntimeConnectionService()

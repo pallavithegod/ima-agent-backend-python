@@ -1,4 +1,5 @@
 .env
+azure-app-settings.json
 .venv/
 storage/
 __pycache__/

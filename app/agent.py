@@ -79,6 +79,10 @@ incident_graph = builder.compile()
 
 
 def analyze_incident(payload: dict[str, Any]) -> dict[str, Any]:
-    result = incident_graph.invoke({"input": payload})
-    return result["incident"]
+    state: IncidentState = {"input": payload}
+    state.update(classify_node(state))
+    state.update(recall_node(state))
+    state.update(diagnose_node(state))
+    state.update(persist_node(state))
+    return state["incident"]
 

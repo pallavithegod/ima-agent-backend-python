@@ -9,7 +9,7 @@ class IncidentCreate(BaseModel):
     error_logs: str = ""
     service_hint: str | None = None
     severity_hint: str | None = None
-    source: Literal["manual", "vercel", "github", "api"] = "manual"
+    source: Literal["manual", "vercel", "render", "github", "api"] = "manual"
     deployment_id: str | None = None
     commit_sha: str | None = None
 

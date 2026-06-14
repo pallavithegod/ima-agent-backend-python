@@ -215,3 +215,21 @@ async def sync_vercel(
         raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.post("/api/integrations/render/sync")
+async def sync_render(
+    limit: int = Query(default=20, ge=1, le=100),
+    authorization: str = Header(),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    try:
+        return await remediation_service.sync_failed_render_deployments(
+            authorization,
+            str(user["sub"]),
+            limit=limit,
+        )
+    except IntegrationConfigurationError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error

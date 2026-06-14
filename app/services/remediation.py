@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -13,7 +14,12 @@ from ..database import (
     list_incidents,
     update_incident,
 )
-from .integrations import github_mcp_service, runtime_connection_service, vercel_service
+from .integrations import (
+    github_mcp_service,
+    render_service,
+    runtime_connection_service,
+    vercel_service,
+)
 from .llm import llm_service
 from .memory import memory_service
 
@@ -45,6 +51,17 @@ PATH_PATTERN = re.compile(
 
 class RemediationService:
     @staticmethod
+    def _error_text(error: BaseException) -> str:
+        nested = getattr(error, "exceptions", None)
+        if nested:
+            details = [
+                RemediationService._error_text(item)
+                for item in nested
+            ]
+            return "; ".join(detail for detail in details if detail)
+        return str(error)
+
+    @staticmethod
     def _retain(callback: Any, value: dict[str, Any]) -> None:
         try:
             callback(value)
@@ -59,6 +76,8 @@ class RemediationService:
         limit: int = 20,
     ) -> dict[str, Any]:
         runtime = await runtime_connection_service.get(authorization)
+        if not runtime.get("vercelToken") or not runtime.get("projects"):
+            raise RuntimeError("Connect and map at least one Vercel project")
         results: list[dict[str, Any]] = []
         failure_count = 0
         processed_deployments: set[str] = set()
@@ -85,7 +104,10 @@ class RemediationService:
             try:
                 results.append(await self._analyze_stored_deployment(stored, runtime, user_id))
             except Exception as error:
-                results.append({"deployment_id": deployment_id, "error": str(error)})
+                results.append({
+                    "deployment_id": deployment_id,
+                    "error": self._error_text(error),
+                })
 
         for project in runtime["projects"]:
             try:
@@ -115,6 +137,89 @@ class RemediationService:
                     results.append({"deployment_id": deployment_id, "error": str(error)})
         return {
             "tracked_projects": len(runtime["projects"]),
+            "failed_deployments": failure_count,
+            "results": results,
+        }
+
+    async def sync_failed_render_deployments(
+        self,
+        authorization: str,
+        user_id: str,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        runtime = await runtime_connection_service.get(authorization)
+        if not runtime.get("renderToken") or not runtime.get("renderServices"):
+            raise RuntimeError("Connect Render and import a matching repository")
+        results: list[dict[str, Any]] = []
+        failure_count = 0
+        for service in runtime["renderServices"]:
+            try:
+                failures = await render_service.failed_deployments(
+                    runtime["renderToken"],
+                    service["render_service_id"],
+                    limit,
+                )
+            except Exception as error:
+                results.append({
+                    "service_id": service["render_service_id"],
+                    "repository": service.get("github_repository"),
+                    "error": str(error),
+                })
+                continue
+            failure_count += len(failures)
+            for deploy in failures:
+                deployment_id = str(deploy.get("id") or "")
+                if not deployment_id:
+                    continue
+                existing = get_incident_by_deployment(deployment_id, user_id)
+                if existing:
+                    results.append(await self._retry_incident(existing, runtime))
+                    continue
+                try:
+                    logs = await render_service.logs(
+                        runtime["renderToken"],
+                        service.get("render_owner_id") or "",
+                        service["render_service_id"],
+                        deploy,
+                    )
+                    git = render_service.git_metadata(deploy)
+                    repository = service["github_repository"]
+                    stored = create_deployment({
+                        "id": deployment_id,
+                        "user_id": user_id,
+                        "platform": "render",
+                        "service": service["render_service_name"],
+                        "status": deploy.get("status") or "build_failed",
+                        "commit_sha": git["commit_sha"],
+                        "message": git["commit_message"] or "Render deployment failed",
+                        "created_at": deploy.get("createdAt"),
+                        "raw_payload": {
+                            "deployment": {
+                                **deploy,
+                                "name": service["render_service_name"],
+                                "readyState": deploy.get("status"),
+                                "meta": {
+                                    "githubOrg": repository.split("/", 1)[0],
+                                    "githubRepo": repository.split("/", 1)[1],
+                                    "githubCommitSha": git["commit_sha"],
+                                    "githubCommitMessage": git["commit_message"],
+                                    "githubCommitRef": deploy.get("branch") or "main",
+                                },
+                            },
+                            "repository": repository,
+                            "git_ref": deploy.get("branch") or "main",
+                            "logs": logs,
+                        },
+                    })
+                    self._retain(memory_service.retain_failure, stored)
+                    results.append(await self._analyze_stored_deployment(stored, runtime, user_id))
+                except Exception as error:
+                    results.append({
+                        "deployment_id": deployment_id,
+                        "error": self._error_text(error),
+                    })
+        return {
+            "tracked_services": len(runtime["renderServices"]),
             "failed_deployments": failure_count,
             "results": results,
         }
@@ -229,6 +334,8 @@ class RemediationService:
         user_id: str,
     ) -> dict[str, Any]:
         deployment_id = str(stored_deployment["id"])
+        platform = str(stored_deployment.get("platform") or "vercel")
+        provider_name = platform.title()
         raw_payload = stored_deployment.get("raw_payload") or {}
         deployment = raw_payload.get("deployment") or {}
         logs = str(raw_payload.get("logs") or "")
@@ -241,6 +348,9 @@ class RemediationService:
 
         commit = await github_mcp_service.commit(runtime["githubToken"], repository, str(git["commit_sha"]))
         changed_files = self._changed_files(commit)
+        commit_diff = self._commit_diff(commit)
+        if commit_diff:
+            logs = f"{logs}\n\nGit diff against parent commit:\n{commit_diff[-20_000:]}"
         file_path, line_number = self._select_file(logs, changed_files)
         if not file_path:
             raise RuntimeError(
@@ -253,23 +363,24 @@ class RemediationService:
         code_snippet = self._snippet(source, line_number)
 
         raw_payload["file_path"] = file_path
-        incident = analyze_incident(
+        incident = await asyncio.to_thread(
+            analyze_incident,
             {
                 "title": f"{stored_deployment['service']} deployment failed",
                 "user_id": user_id,
                 "description": deployment.get("errorMessage")
                 or deployment.get("errorCode")
-                or "Vercel reported a failed production deployment",
+                or f"{provider_name} reported a failed production deployment",
                 "error_logs": logs,
                 "service_hint": stored_deployment["service"],
-                "source": "vercel",
+                "source": platform,
                 "deployment_id": deployment_id,
                 "commit_sha": git["commit_sha"],
                 "repository": repository,
                 "git_ref": git["git_ref"],
                 "file_path": file_path,
                 "code_snippet": code_snippet,
-            }
+            },
         )
         try:
             fix = llm_service.fix_suggestion(incident, source, file_path)
@@ -391,6 +502,25 @@ class RemediationService:
 
         visit(commit)
         return list(dict.fromkeys(files))
+
+    @staticmethod
+    def _commit_diff(commit: Any) -> str:
+        patches: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                filename = value.get("filename") or value.get("path")
+                patch = value.get("patch")
+                if filename and patch:
+                    patches.append(f"--- {filename}\n+++ {filename}\n{patch}")
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(commit)
+        return "\n".join(dict.fromkeys(patches))
 
     @staticmethod
     def _select_file(logs: str, changed_files: list[str]) -> tuple[str | None, int | None]:
