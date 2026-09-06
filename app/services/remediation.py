@@ -1,5 +1,4 @@
 import asyncio
-import re
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -14,39 +13,12 @@ from ..database import (
     list_incidents,
     update_incident,
 )
-from .integrations import (
-    github_mcp_service,
-    render_service,
-    runtime_connection_service,
-    vercel_service,
-)
+from .fixer import PATH_PATTERN, SOURCE_EXTENSIONS, fixer_service
+from .github_rest import github_rest_service
+from .integrations import render_service, vercel_service
 from .llm import llm_service
 from .memory import memory_service
-
-
-SOURCE_EXTENSIONS = {
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".mjs",
-    ".cjs",
-    ".py",
-    ".go",
-    ".java",
-    ".rb",
-    ".php",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".toml",
-}
-
-PATH_PATTERN = re.compile(
-    r"(?P<path>(?:\.?/)?[A-Za-z0-9_./@()-]+"
-    r"\.(?:js|jsx|ts|tsx|mjs|cjs|py|go|java|rb|php|json|yaml|yml|toml))"
-    r"(?::(?P<line>\d+)(?::\d+)?)?"
-)
+from .runtime import get_runtime
 
 
 class RemediationService:
@@ -71,11 +43,10 @@ class RemediationService:
 
     async def sync_failed_deployments(
         self,
-        authorization: str,
         user_id: str,
         limit: int = 20,
     ) -> dict[str, Any]:
-        runtime = await runtime_connection_service.get(authorization)
+        runtime = await get_runtime(user_id)
         if not runtime.get("vercelToken") or not runtime.get("projects"):
             raise RuntimeError("Connect and map at least one Vercel project")
         results: list[dict[str, Any]] = []
@@ -143,11 +114,10 @@ class RemediationService:
 
     async def sync_failed_render_deployments(
         self,
-        authorization: str,
         user_id: str,
         limit: int = 20,
     ) -> dict[str, Any]:
-        runtime = await runtime_connection_service.get(authorization)
+        runtime = await get_runtime(user_id)
         if not runtime.get("renderToken") or not runtime.get("renderServices"):
             raise RuntimeError("Connect Render and import a matching repository")
         results: list[dict[str, Any]] = []
@@ -269,7 +239,7 @@ class RemediationService:
         missing = [field for field in required if not incident.get(field)]
         if missing:
             raise RuntimeError(f"Incident is missing fix context: {', '.join(missing)}")
-        source_file = await github_mcp_service.file(
+        source_file = await github_rest_service.file(
             runtime["githubToken"],
             incident["repository"],
             incident["file_path"],
@@ -346,7 +316,7 @@ class RemediationService:
         if not repository:
             raise RuntimeError("Vercel deployment did not include a GitHub repository")
 
-        commit = await github_mcp_service.commit(runtime["githubToken"], repository, str(git["commit_sha"]))
+        commit = await github_rest_service.commit(runtime["githubToken"], repository, str(git["commit_sha"]))
         changed_files = self._changed_files(commit)
         commit_diff = self._commit_diff(commit)
         if commit_diff:
@@ -356,7 +326,7 @@ class RemediationService:
             raise RuntimeError(
                 "Could not identify the failing source file from Vercel logs or commit"
             )
-        source_file = await github_mcp_service.file(
+        source_file = await github_rest_service.file(
             runtime["githubToken"], repository, file_path, str(git["commit_sha"])
         )
         source = str(source_file["content"])
@@ -427,10 +397,9 @@ class RemediationService:
     async def create_draft_pr(
         self,
         incident_id: str,
-        authorization: str,
         user_id: str,
     ) -> dict[str, Any]:
-        runtime = await runtime_connection_service.get(authorization)
+        runtime = await get_runtime(user_id)
         incident = get_incident(incident_id, user_id)
         if not incident:
             raise ValueError("Incident not found")
@@ -450,33 +419,54 @@ class RemediationService:
     ) -> dict[str, Any]:
         if incident.get("pull_request_url"):
             return incident
+        if not incident.get("repository"):
+            raise RuntimeError("Incident is missing remediation data: repository")
+        try:
+            return await fixer_service.fix_and_pr(incident, runtime["githubToken"])
+        except Exception as clone_error:
+            # Degraded path: push the already-generated single-file fix through
+            # the contents API when cloning or the multi-file fix fails.
+            fallback = await self._single_file_pr_fallback(incident, runtime)
+            if fallback is not None:
+                return fallback
+            raise clone_error
+
+    async def _single_file_pr_fallback(
+        self,
+        incident: dict[str, Any],
+        runtime: dict[str, Any],
+    ) -> dict[str, Any] | None:
         required = ("repository", "file_path", "commit_sha", "fixed_content")
-        missing = [field for field in required if not incident.get(field)]
-        if missing:
-            raise RuntimeError(f"Incident is missing remediation data: {', '.join(missing)}")
-        source_file = await github_mcp_service.file(
-            runtime["githubToken"], incident["repository"], incident["file_path"], incident["commit_sha"]
-        )
-        branch_name = f"recallops/fix-{incident['id'][:8]}"
-        base_branch = incident.get("git_ref") or get_settings().github_default_branch
-        url = await github_mcp_service.create_draft_pull_request(
-            token=runtime["githubToken"],
-            repository=incident["repository"],
-            base_branch=base_branch,
-            file_path=incident["file_path"],
-            current_file_sha=str(source_file.get("sha") or ""),
-            fixed_content=incident["fixed_content"],
-            title=f"fix: {incident['fix_summary'][:72]}",
-            body=(
-                "Draft remediation generated from a failed Vercel deployment.\n\n"
-                f"Deployment: {incident['deployment_id']}\n"
-                f"Commit: {incident['commit_sha']}\n\n"
-                f"Diagnosis: {incident['diagnosis']}\n\n"
-                f"Rationale: {incident['fix_rationale']}\n\n"
-                "This pull request requires human review and validation."
-            ),
-            branch_name=branch_name,
-        )
+        if any(not incident.get(field) for field in required):
+            return None
+        try:
+            source_file = await github_rest_service.file(
+                runtime["githubToken"],
+                incident["repository"],
+                incident["file_path"],
+                incident["commit_sha"],
+            )
+            base_branch = incident.get("git_ref") or get_settings().github_default_branch
+            url = await github_rest_service.single_file_pr(
+                token=runtime["githubToken"],
+                repository=incident["repository"],
+                base_branch=base_branch,
+                branch_name=f"recallops/fix-{incident['id'][:8]}",
+                file_path=incident["file_path"],
+                current_file_sha=str(source_file.get("sha") or ""),
+                fixed_content=incident["fixed_content"],
+                title=f"fix: {incident['fix_summary'][:72]}",
+                body=(
+                    "Draft remediation generated from a failed deployment.\n\n"
+                    f"Deployment: {incident['deployment_id']}\n"
+                    f"Commit: {incident['commit_sha']}\n\n"
+                    f"Diagnosis: {incident['diagnosis']}\n\n"
+                    f"Rationale: {incident['fix_rationale']}\n\n"
+                    "This pull request requires human review and validation."
+                ),
+            )
+        except Exception:
+            return None
         updated = update_incident(incident["id"], {"pull_request_url": url})
         if not updated:
             raise RuntimeError("Draft pull request was created but the incident could not be updated")

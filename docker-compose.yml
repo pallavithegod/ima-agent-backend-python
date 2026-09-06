@@ -1,0 +1,91 @@
+name: recallops
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: recallops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-recallops}
+      POSTGRES_DB: recallops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 5433 on the host: many machines already run a native Postgres on 5432.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recallops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  agent-backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://recallops:${POSTGRES_PASSWORD:-recallops}@postgres:5432/recallops
+      WORKSPACES_DIR: /srv/app/storage/workspaces
+    volumes:
+      - workspaces:/srv/app/storage/workspaces
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../ima-agent
+      args:
+        VITE_API_URL: ${FRONTEND_API_URL:-http://localhost:8000}
+        VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+        VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+        VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+        VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
+    ports:
+      - "5173:80"
+    depends_on:
+      - agent-backend
+    restart: unless-stopped
+
+  # "Project VM" one: Express storefront + sidecar watcher.
+  # Register the VM first (POST /api/vms), then set APP_ONE_VM_ID/KEY in .env.
+  app-one:
+    build:
+      context: .
+      dockerfile: demo-apps/flaky-shop/Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      AGENT_URL: http://agent-backend:8000
+      VM_ID: ${APP_ONE_VM_ID:-}
+      VM_API_KEY: ${APP_ONE_VM_KEY:-}
+    depends_on:
+      - agent-backend
+    restart: unless-stopped
+
+  # "Project VM" two: Flask notes app + sidecar watcher.
+  app-two:
+    build:
+      context: .
+      dockerfile: demo-apps/flaky-notes/Dockerfile
+    ports:
+      - "3002:5000"
+    environment:
+      AGENT_URL: http://agent-backend:8000
+      VM_ID: ${APP_TWO_VM_ID:-}
+      VM_API_KEY: ${APP_TWO_VM_KEY:-}
+    depends_on:
+      - agent-backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  workspaces:

@@ -1,10 +1,5 @@
-.env
-azure-app-settings.json
 .venv/
-storage/
 __pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-reports/
-venv/
+storage/
+.env
+service-account.json

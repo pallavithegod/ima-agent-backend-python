@@ -2,43 +2,71 @@ import json
 import re
 from typing import Any
 
-from openai import OpenAI
+from openai import AzureOpenAI, OpenAI
 
 from ..config import get_settings
 
 
 class LLMService:
+    """LLM access. Prefers an Azure OpenAI deployment (e.g. gpt-5.5), falls
+    back to DeepSeek, then to keyword heuristics when neither is configured."""
+
     def __init__(self) -> None:
         self.settings = get_settings()
-        self.client = (
-            OpenAI(
+        self.client = None
+        self.model = ""
+        self._azure = False
+        if self.settings.azure_openai_configured:
+            self.client = AzureOpenAI(
+                api_key=self.settings.azure_openai_api_key,
+                azure_endpoint=self.settings.azure_openai_endpoint,
+                api_version=self.settings.azure_openai_api_version,
+            )
+            self.model = self.settings.azure_openai_deployment
+            self._azure = True
+        elif self.settings.deepseek_api_key:
+            self.client = OpenAI(
                 api_key=self.settings.deepseek_api_key,
                 base_url="https://api.deepseek.com",
             )
-            if self.settings.deepseek_api_key
-            else None
-        )
+            self.model = self.settings.deepseek_model
 
     @property
     def mode(self) -> str:
-        return "deepseek" if self.client else "local"
+        if not self.client:
+            return "local"
+        return f"azure:{self.model}" if self._azure else "deepseek"
+
+    def _chat_json(self, system: str, prompt: str) -> dict[str, Any]:
+        """One JSON-mode chat completion; raises on missing client/invalid JSON."""
+        if not self.client:
+            raise RuntimeError(
+                "Configure AZURE_OPENAI_* (or DEEPSEEK_API_KEY) to generate code fixes"
+            )
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        if self._azure:
+            # GPT-5-family deployments reject custom temperature and use
+            # max_completion_tokens instead of max_tokens.
+            kwargs["max_completion_tokens"] = 16384
+        else:
+            kwargs["temperature"] = 0.1
+            kwargs["max_tokens"] = 8192
+        response = self.client.chat.completions.create(**kwargs)
+        content = response.choices[0].message.content or ""
+        return json.loads(content)
 
     def structured(self, system: str, prompt: str, fallback: dict[str, Any]) -> dict[str, Any]:
         if not self.client:
             return fallback
         try:
-            response = self.client.chat.completions.create(
-                model=self.settings.deepseek_model,
-                temperature=0.1,
-                max_tokens=8192,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            content = response.choices[0].message.content or "{}"
-            return json.loads(content)
+            return self._chat_json(system, prompt)
         except Exception:
             return fallback
 
@@ -80,8 +108,6 @@ class LLMService:
         source: str,
         file_path: str,
     ) -> dict[str, str]:
-        if not self.client:
-            raise RuntimeError("DEEPSEEK_API_KEY is required to generate a code fix")
         result = self.structured(
             (
                 "You are a senior production engineer. Return JSON with summary, rationale, "
@@ -93,8 +119,63 @@ class LLMService:
         )
         required = {"summary", "rationale", "diff", "fixed_content"}
         if not required.issubset(result) or not result["fixed_content"]:
-            raise RuntimeError("DeepSeek returned an incomplete code fix")
+            raise RuntimeError("The LLM returned an incomplete code fix")
         return {key: str(result[key]) for key in required}
+
+    def fix_files(
+        self,
+        incident: dict[str, Any],
+        files: list[dict[str, str]],
+        file_tree: list[str],
+        logs: str,
+        commit_diff: str = "",
+    ) -> dict[str, Any]:
+        """Multi-file fix for the clone-based fixer. Unlike structured(), this
+        fails loudly: a swallowed error would silently produce an empty PR."""
+        file_sections = "\n\n".join(
+            f"=== {item['path']} ===\n{item['content'][:30000]}" for item in files
+        )
+        prompt = (
+            f"Incident diagnosis:\n{json.dumps({k: incident.get(k) for k in ('title', 'description', 'diagnosis', 'root_cause', 'error_category', 'service')})}\n\n"
+            f"Error logs (tail):\n{logs[-20000:]}\n\n"
+            + (f"Last commit diff:\n{commit_diff[-20000:]}\n\n" if commit_diff else "")
+            + f"Repository file tree (partial):\n{chr(10).join(file_tree[:400])}\n\n"
+            f"Candidate source files:\n{file_sections}"
+        )
+        response = self.client.chat.completions.create(
+            model=self.settings.deepseek_model,
+            temperature=0.1,
+            max_tokens=8192,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior production engineer fixing the root cause of a "
+                        "production incident. Return only JSON: {\"summary\": str, "
+                        "\"rationale\": str, \"files\": [{\"path\": str, \"action\": "
+                        "\"update\"|\"create\", \"content\": str}]}. Each content value must "
+                        "be the complete corrected file with no markdown fences. Change as "
+                        "few files and lines as possible; preserve unrelated code exactly."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("DeepSeek returned invalid JSON for the multi-file fix") from error
+        files_out = result.get("files")
+        if (
+            not result.get("summary")
+            or not isinstance(files_out, list)
+            or not files_out
+            or not all(item.get("path") and item.get("content") for item in files_out)
+        ):
+            raise RuntimeError("DeepSeek returned an incomplete multi-file fix")
+        return result
 
     @staticmethod
     def _detect_service(text: str) -> str:
