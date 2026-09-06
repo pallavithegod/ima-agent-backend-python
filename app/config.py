@@ -27,9 +27,16 @@ class Settings(BaseSettings):
     vercel_callback_url: str = "http://localhost:8000/api/integrations/vercel/callback"
     vercel_scopes: str = "openid profile email offline_access"
 
-    # AI pipeline
+    # AI pipeline — Azure OpenAI is the primary LLM; DeepSeek is the fallback.
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
+    azure_openai_deployment: str = "gpt-5.5"
+    azure_openai_api_version: str = "2024-12-01-preview"
     deepseek_api_key: str = ""
     deepseek_model: str = "deepseek-v4-pro"
+    # Personal-access-token fallback for PR creation when no GitHub connection
+    # is stored (i.e. before the first Firebase GitHub sign-in).
+    github_token: str = ""
     hindsight_api_url: str = ""
     hindsight_api_key: str = ""
     hindsight_bank_id: str = "incident-memory-agent"
@@ -69,6 +76,10 @@ class Settings(BaseSettings):
     @property
     def deepseek_configured(self) -> bool:
         return bool(self.deepseek_api_key)
+
+    @property
+    def azure_openai_configured(self) -> bool:
+        return bool(self.azure_openai_endpoint and self.azure_openai_api_key)
 
     @property
     def vercel_oauth_configured(self) -> bool:

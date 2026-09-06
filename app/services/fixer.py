@@ -3,6 +3,7 @@ the LLM, push a branch, and open a draft PR with the user's GitHub token."""
 
 import asyncio
 import difflib
+import json
 import os
 import re
 import shutil
@@ -125,6 +126,14 @@ class CloneFixerService:
         )
         applied = self._apply_fix(workspace, tree, fix, logs)
 
+        # Verification pass: a second LLM review of the concrete diff must
+        # approve the change before anything is pushed to GitHub.
+        verdict = await asyncio.to_thread(
+            llm_service.verify_fix, incident, applied["diff"], logs
+        )
+        if not verdict["approved"]:
+            raise FixerError(f"Fix failed verification: {verdict['reason']}")
+
         branch_name = f"recallops/fix-{incident['id'][:8]}"
         summary = str(fix.get("summary") or "automated remediation")[:72]
         await self._git(workspace, "checkout", "-b", branch_name)
@@ -151,6 +160,7 @@ class CloneFixerService:
                 + (f"Commit: {incident['commit_sha']}\n" if incident.get("commit_sha") else "")
                 + f"\nDiagnosis: {incident.get('diagnosis')}\n\n"
                 f"Rationale: {fix.get('rationale')}\n\n"
+                f"Automated verification: {verdict['reason']}\n\n"
                 "This pull request requires human review and validation."
             ),
             draft=True,
@@ -194,6 +204,18 @@ class CloneFixerService:
                     candidates.append(manifest)
         return candidates[:MAX_CANDIDATE_FILES]
 
+    @staticmethod
+    def _static_check(rel: str, content: str) -> None:
+        """Cheap syntax sanity checks so obviously broken fixes never ship."""
+        suffix = PurePosixPath(rel).suffix
+        try:
+            if suffix == ".py":
+                compile(content, rel, "exec")
+            elif suffix == ".json":
+                json.loads(content)
+        except (SyntaxError, ValueError) as error:
+            raise FixerError(f"Fix produces invalid {suffix} in {rel}: {error}") from error
+
     def _apply_fix(
         self,
         workspace: Path,
@@ -233,6 +255,7 @@ class CloneFixerService:
             elif change.get("action") != "create" and rel not in set(tree):
                 raise FixerError(f"Fix updates a file that does not exist: {rel}")
             after = str(change["content"])
+            self._static_check(rel, after)
             diff_lines = list(
                 difflib.unified_diff(
                     before.splitlines(keepends=True),

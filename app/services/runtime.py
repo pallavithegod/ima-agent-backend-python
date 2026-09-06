@@ -75,14 +75,23 @@ async def vercel_access_token(user_id: int | str) -> str:
 
 
 async def get_runtime(user_id: int | str) -> dict[str, Any]:
-    """Same shape the remediation pipeline consumed from the Node backend."""
+    """Same shape the remediation pipeline consumed from the Node backend.
+
+    GitHub token resolution: the user's stored connection (from GitHub
+    sign-in) wins; the GITHUB_TOKEN env PAT is the fallback so automated PRs
+    work before anyone has signed in with GitHub."""
     github = connection(user_id, "github")
-    if not github:
-        raise IntegrationConfigurationError("Connect GitHub first")
+    github_token = (
+        decrypt_secret(github["access_token"]) if github else get_settings().github_token
+    )
+    if not github_token:
+        raise IntegrationConfigurationError(
+            "Connect GitHub first (sign in with GitHub, or set GITHUB_TOKEN in .env)"
+        )
     vercel = connection(user_id, "vercel")
     render = connection(user_id, "render")
     return {
-        "githubToken": decrypt_secret(github["access_token"]),
+        "githubToken": github_token,
         "vercelToken": await vercel_access_token(user_id) if vercel else None,
         "renderToken": decrypt_secret(render["access_token"]) if render else None,
         "projects": repo.list_tracked_projects(user_id, enabled_only=True),

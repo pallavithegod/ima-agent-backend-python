@@ -142,31 +142,20 @@ class LLMService:
             + f"Repository file tree (partial):\n{chr(10).join(file_tree[:400])}\n\n"
             f"Candidate source files:\n{file_sections}"
         )
-        response = self.client.chat.completions.create(
-            model=self.settings.deepseek_model,
-            temperature=0.1,
-            max_tokens=8192,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a senior production engineer fixing the root cause of a "
-                        "production incident. Return only JSON: {\"summary\": str, "
-                        "\"rationale\": str, \"files\": [{\"path\": str, \"action\": "
-                        "\"update\"|\"create\", \"content\": str}]}. Each content value must "
-                        "be the complete corrected file with no markdown fences. Change as "
-                        "few files and lines as possible; preserve unrelated code exactly."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.choices[0].message.content or ""
         try:
-            result = json.loads(content)
+            result = self._chat_json(
+                (
+                    "You are a senior production engineer fixing the root cause of a "
+                    "production incident. Return only JSON: {\"summary\": str, "
+                    "\"rationale\": str, \"files\": [{\"path\": str, \"action\": "
+                    "\"update\"|\"create\", \"content\": str}]}. Each content value must "
+                    "be the complete corrected file with no markdown fences. Change as "
+                    "few files and lines as possible; preserve unrelated code exactly."
+                ),
+                prompt,
+            )
         except json.JSONDecodeError as error:
-            raise RuntimeError("DeepSeek returned invalid JSON for the multi-file fix") from error
+            raise RuntimeError("The LLM returned invalid JSON for the multi-file fix") from error
         files_out = result.get("files")
         if (
             not result.get("summary")
@@ -174,8 +163,42 @@ class LLMService:
             or not files_out
             or not all(item.get("path") and item.get("content") for item in files_out)
         ):
-            raise RuntimeError("DeepSeek returned an incomplete multi-file fix")
+            raise RuntimeError("The LLM returned an incomplete multi-file fix")
         return result
+
+    def verify_fix(
+        self,
+        incident: dict[str, Any],
+        diff: str,
+        logs: str,
+    ) -> dict[str, Any]:
+        """Second-pass review of a generated fix before it is pushed. Returns
+        {"approved": bool, "reason": str}. Fails open only when no LLM is
+        configured (local mode has no reviewer)."""
+        if not self.client:
+            return {"approved": True, "reason": "No LLM configured; verification skipped"}
+        try:
+            result = self._chat_json(
+                (
+                    "You are a strict code reviewer verifying an automated production "
+                    "fix. Approve ONLY if the diff plausibly resolves the incident's "
+                    "error, changes nothing unrelated, introduces no obvious syntax "
+                    "errors, secrets, or destructive operations. Return only JSON: "
+                    "{\"approved\": bool, \"reason\": str}."
+                ),
+                (
+                    f"Incident diagnosis:\n"
+                    f"{json.dumps({k: incident.get(k) for k in ('title', 'diagnosis', 'root_cause', 'error_category')})}\n\n"
+                    f"Error logs (tail):\n{logs[-10000:]}\n\n"
+                    f"Proposed diff:\n{diff[:40000]}"
+                ),
+            )
+        except Exception as error:
+            return {"approved": False, "reason": f"Verification call failed: {error}"}
+        return {
+            "approved": bool(result.get("approved")),
+            "reason": str(result.get("reason") or "No reason given"),
+        }
 
     @staticmethod
     def _detect_service(text: str) -> str:

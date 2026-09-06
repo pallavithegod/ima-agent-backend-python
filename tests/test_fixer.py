@@ -101,3 +101,19 @@ def test_candidate_files_prefers_incident_and_log_paths(workspace):
     assert candidates[0] == "server.js"
     assert "src/pricing.js" in candidates
     assert "package.json" in candidates
+
+
+def test_static_check_rejects_invalid_python(workspace):
+    with pytest.raises(FixerError, match="invalid .py"):
+        _apply(
+            workspace,
+            {"files": [{"path": "broken.py", "action": "create", "content": "def broken(:\n"}]},
+        )
+
+
+def test_static_check_rejects_invalid_json(workspace):
+    with pytest.raises(FixerError, match="invalid .json"):
+        _apply(
+            workspace,
+            {"files": [{"path": "package.json", "action": "update", "content": "{not json"}]},
+        )

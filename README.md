@@ -6,15 +6,19 @@ The single backend for RecallOps, a self-healing incident platform. It owns:
 - **Integrations** — GitHub repo import & activity, Vercel (OAuth PKCE or personal
   access token), Render; encrypted provider tokens (AES-256-GCM) in Postgres.
 - **AI incident pipeline** — LangGraph classify → recall (Hindsight memory) →
-  diagnose (DeepSeek), incident storage, analytics, on-call handoff, PDF reports.
+  diagnose (Azure OpenAI GPT-5.5, DeepSeek fallback), incident storage,
+  analytics, on-call handoff, PDF reports.
 - **Self-healing** — three sources of failure signals:
   1. **Project VMs** (primary): sidecar watchers on each app VM/container report
      crashes, failed health checks and heartbeats to `/api/vms/*`.
   2. **Vercel/Render** deployment sync.
   3. **Commit monitor**: polls imported GitHub repos and inspects deployments.
   On failure the agent diagnoses the incident, **clones the repo, generates a
-  multi-file fix with the LLM, pushes a branch and opens a draft PR** using the
-  user's GitHub token (single-file contents-API fallback if cloning fails).
+  multi-file fix with the LLM, verifies the fix (static syntax checks plus a
+  second LLM review of the diff), pushes a branch and opens a draft PR** using
+  the user's GitHub token — the stored GitHub sign-in token, or the
+  `GITHUB_TOKEN` PAT from `.env` as fallback (single-file contents-API
+  fallback if cloning fails).
 
 The old Node backend (`ima-agent-backend-node`) is retired — everything it did
 lives here now, minus the Firestore credential mirror (dropped intentionally).
@@ -22,10 +26,23 @@ lives here now, minus the Firestore credential mirror (dropped intentionally).
 ## Local quickstart (Docker Desktop)
 
 ```bash
-cp .env.example .env          # fill in AUTH_JWT_SECRET, DEEPSEEK_API_KEY,
-                              # FIREBASE_SERVICE_ACCOUNT_BASE64, VITE_FIREBASE_*
+cp .env.example .env          # fill in the credentials below
 docker compose up -d --build  # postgres, agent-backend, frontend, app-one, app-two
 ```
+
+Required credentials in `.env`:
+
+| Variable | What it is |
+|---|---|
+| `AZURE_OPENAI_ENDPOINT` | `https://<resource>.openai.azure.com` of your Azure OpenAI resource |
+| `AZURE_OPENAI_API_KEY` | key from the Azure resource (Keys & Endpoint blade) |
+| `AZURE_OPENAI_DEPLOYMENT` | your deployment name (default `gpt-5.5`) |
+| `GITHUB_TOKEN` | GitHub PAT with `repo` scope — used to push fix branches & open PRs until you sign in with GitHub |
+| `AUTH_JWT_SECRET` | ≥32-char secret for JWTs (keep the old Node value for existing sessions) |
+| `CREDENTIAL_ENCRYPTION_KEY` | ≥32-char secret for token encryption at rest |
+| `FIREBASE_SERVICE_ACCOUNT_BASE64` | base64 of the Firebase service-account JSON (GitHub sign-in) |
+| `VITE_FIREBASE_*` | Firebase web config for the frontend build |
+| Optional: `DEEPSEEK_API_KEY`, `HINDSIGHT_*`, `VERCEL_CLIENT_ID/SECRET` | LLM fallback, memory layer, Vercel OAuth |
 
 - Frontend: http://localhost:5173 · API: http://localhost:8000 · Postgres: localhost:5433
 - Demo apps: flaky-shop http://localhost:3001, flaky-notes http://localhost:3002
