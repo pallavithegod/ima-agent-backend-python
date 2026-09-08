@@ -81,8 +81,50 @@ def get_incident_by_deployment(
         return _row(session.scalars(query).first())
 
 
+def _coerce_text(value: Any, default: str = "") -> str:
+    """LLM outputs sometimes nest objects where the schema expects prose."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
+
+
+def _coerce_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def create_incident(data: dict[str, Any]) -> dict[str, Any]:
     now = now_iso()
+    data = {
+        **data,
+        **{
+            key: _coerce_text(data.get(key))
+            for key in (
+                "title",
+                "description",
+                "diagnosis",
+                "root_cause",
+                "impact",
+                "service",
+                "severity",
+                "error_category",
+                "root_cause_type",
+            )
+            if key in data
+        },
+        **{
+            key: _coerce_list(data.get(key))
+            for key in ("resolution_steps", "action_items", "timeline", "retrieved_memories")
+            if key in data
+        },
+    }
     item = {
         "id": data.get("id", str(uuid4())),
         "user_id": str(data.get("user_id", "")),

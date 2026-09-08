@@ -117,3 +117,15 @@ def test_static_check_rejects_invalid_json(workspace):
             workspace,
             {"files": [{"path": "package.json", "action": "update", "content": "{not json"}]},
         )
+
+
+def test_candidate_files_strips_runtime_path_prefixes(workspace):
+    service = CloneFixerService()
+    tree = ["src/pricing.js", "server.js", "package.json"]
+    candidates = service._candidate_files(
+        {},
+        "TypeError at file:///app/src/pricing.js:6:32\n    at /app/server.js:41:19",
+        tree,
+    )
+    assert "src/pricing.js" in candidates
+    assert "server.js" in candidates

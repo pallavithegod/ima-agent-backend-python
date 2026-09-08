@@ -190,13 +190,9 @@ class CloneFixerService:
             candidates.append(incident["file_path"])
         for match in reversed(list(PATH_PATTERN.finditer(logs))):
             path = match.group("path").lstrip("./")
-            if path in tree_set and path not in candidates:
-                candidates.append(path)
-            # Log paths often carry a build prefix; fall back to suffix match.
-            elif path not in candidates:
-                suffix_hits = [item for item in tree if item.endswith("/" + path) or item == path]
-                if len(suffix_hits) == 1 and suffix_hits[0] not in candidates:
-                    candidates.append(suffix_hits[0])
+            resolved = self._resolve_in_tree(path, tree, tree_set)
+            if resolved and resolved not in candidates:
+                candidates.append(resolved)
         lowered = logs.lower()
         if any(marker in lowered for marker in DEPENDENCY_MARKERS):
             for manifest in ("package.json", "requirements.txt", "pyproject.toml"):
@@ -215,6 +211,21 @@ class CloneFixerService:
                 json.loads(content)
         except (SyntaxError, ValueError) as error:
             raise FixerError(f"Fix produces invalid {suffix} in {rel}: {error}") from error
+
+    @staticmethod
+    def _resolve_in_tree(path: str, tree: list[str], tree_set: set[str]) -> str | None:
+        """Map a path from logs onto the repo tree. Runtime paths often carry a
+        deployment prefix (/app/src/x.js vs src/x.js) — strip leading segments;
+        build paths may instead be shorter than the tree path — suffix-match."""
+        if path in tree_set:
+            return path
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            candidate = "/".join(parts[index:])
+            if candidate in tree_set:
+                return candidate
+        suffix_hits = [item for item in tree if item.endswith("/" + path)]
+        return suffix_hits[0] if len(suffix_hits) == 1 else None
 
     def _apply_fix(
         self,
