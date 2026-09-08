@@ -198,7 +198,30 @@ class CloneFixerService:
             for manifest in ("package.json", "requirements.txt", "pyproject.toml"):
                 if manifest in tree_set and manifest not in candidates:
                     candidates.append(manifest)
+        if not candidates:
+            candidates = self._keyword_candidates(incident, logs, tree)
         return candidates[:MAX_CANDIDATE_FILES]
+
+    @staticmethod
+    def _keyword_candidates(
+        incident: dict[str, Any], logs: str, tree: list[str]
+    ) -> list[str]:
+        """Fallback when logs carry no file paths (e.g. a handler that prints
+        only the exception message): rank source files by how often their name
+        stem appears in the logs/diagnosis, then by size ascending."""
+        text = f"{logs}\n{incident.get('description') or ''}\n{incident.get('diagnosis') or ''}".lower()
+        words = set(re.findall(r"[a-z_][a-z0-9_]{2,}", text))
+        source_files = [
+            item for item in tree if PurePosixPath(item).suffix in SOURCE_EXTENSIONS
+        ]
+        scored = sorted(
+            source_files,
+            key=lambda item: (
+                -(PurePosixPath(item).stem.lower() in words),
+                len(item),
+            ),
+        )
+        return scored[:MAX_CANDIDATE_FILES]
 
     @staticmethod
     def _static_check(rel: str, content: str) -> None:

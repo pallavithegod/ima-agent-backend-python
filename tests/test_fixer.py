@@ -129,3 +129,16 @@ def test_candidate_files_strips_runtime_path_prefixes(workspace):
     )
     assert "src/pricing.js" in candidates
     assert "server.js" in candidates
+
+
+def test_keyword_fallback_when_logs_have_no_paths(workspace):
+    service = CloneFixerService()
+    tree = ["app.py", "storage.py", "README.md", "requirements.txt"]
+    candidates = service._candidate_files(
+        {"diagnosis": "The storage layer raised KeyError('body') during export."},
+        "FATAL: notes export failed: KeyError('body')",
+        tree,
+    )
+    assert candidates
+    assert candidates[0] == "storage.py"
+    assert "README.md" not in candidates

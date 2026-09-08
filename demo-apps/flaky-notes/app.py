@@ -1,4 +1,5 @@
 import os
+import traceback
 
 from flask import Flask, jsonify
 
@@ -36,6 +37,7 @@ def notes_export():
         # supervisor can restart it (and RecallOps can diagnose the incident).
         # os._exit is used because the dev server runs handlers in threads,
         # where SystemExit would not terminate the process.
+        traceback.print_exc()
         print(f"FATAL: notes export failed: {error!r}", flush=True)
         os._exit(1)
 
