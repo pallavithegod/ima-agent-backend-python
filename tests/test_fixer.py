@@ -83,7 +83,7 @@ def test_apply_fix_rejects_updates_to_missing_files(workspace):
 
 
 def test_apply_fix_rejects_no_op(workspace):
-    with pytest.raises(FixerError, match="does not change"):
+    with pytest.raises(FixerError, match="already contains a fix"):
         _apply(
             workspace,
             {"files": [{"path": "src/pricing.js", "action": "update", "content": "const total = 1;\n"}]},

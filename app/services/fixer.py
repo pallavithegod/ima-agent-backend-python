@@ -309,7 +309,11 @@ class CloneFixerService:
                 primary_content = after
 
         if total_changed == 0:
-            raise FixerError("Generated fix does not change any lines")
+            raise FixerError(
+                "The latest code on the default branch already contains a fix for "
+                "this incident — the crashing instance is likely running outdated "
+                "code. Redeploy the service instead of opening a new PR."
+            )
         if total_changed > settings.fixer_max_changed_lines:
             raise FixerError(
                 f"Fix changes {total_changed} lines (limit {settings.fixer_max_changed_lines})"
